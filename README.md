@@ -120,7 +120,4 @@ OpenAI / Anthropic backends
 ## Author
 
 Built by [Josna Deepa Rayana](https://github.com/Josna-R), AI/ML Engineer &
-Data Scientist. Part of a three-project GenAI portfolio alongside
-[DocuMind RAG](https://github.com/Josna-R/documind-rag) (retrieval-augmented
-generation) and [RAGuard](https://github.com/Josna-R/raguard-eval)
-(LLM evaluation & hallucination detection).
+Data Scientist. 
