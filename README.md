@@ -48,6 +48,13 @@ concurrency and reliability *real*:
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design
 rationale and a diagram of the graph.
 
+## Get the code
+
+```bash
+git clone https://github.com/Josna-R/agentcrew-multiagent.git
+cd agentcrew-multiagent
+```
+
 ## Quickstart
 
 ```bash
