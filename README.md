@@ -19,11 +19,6 @@ offline knowledge-base-backed search tool), so you can clone it and run it
 with zero API keys and zero network access. Optional OpenAI/Anthropic
 backends are available as a drop-in swap for production use.
 
-Built by [Josna Deepa Rayana](https://github.com/Josna-R) as a portfolio
-project demonstrating production-minded multi-agent system design: real
-concurrency, bounded loops, separated failure modes, cost observability, and
-resumable runs.
-
 ## Why this exists
 
 A lot of "multi-agent" demos run agents one after another and call it
