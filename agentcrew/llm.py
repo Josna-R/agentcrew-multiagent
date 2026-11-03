@@ -1,112 +1,188 @@
-"""
-Pluggable LLM used by every agent node.
+"""LLM backends used by AgentCrew agents.
 
-Defaults to `FakeLLM`, a deterministic, template-driven generator, so the
-whole multi-agent graph runs end-to-end offline with zero API cost -- handy
-for demos, CI, and anyone cloning the repo without wanting to provision a
-key just to see how the orchestration works. Point `AGENTCREW_LLM=openai`
-(with OPENAI_API_KEY set) or `AGENTCREW_LLM=anthropic` at a real model for
-production-quality output; every node calls the same `LLM.complete()`
-interface so no orchestration code changes.
+``FakeLLM`` is the default, fully offline backend: it produces deterministic,
+role-specific text so the whole graph can be built, tested, and demoed with
+zero API keys and zero network access. ``OpenAILLM`` and ``AnthropicLLM`` are
+thin real-API wrappers for production use; both are optional (their SDKs are
+imported lazily) and both wrap their network call with
+``@retry_with_backoff`` from :mod:`agentcrew.resilience`.
 """
+
 from __future__ import annotations
 
-import abc
-import os
-import textwrap
+import re
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+from agentcrew.resilience import retry_with_backoff
+from agentcrew.tools import SearchHit, WebSearchTool
 
 
-class LLM(abc.ABC):
-    @abc.abstractmethod
-    def complete(self, role: str, prompt: str) -> str:
-        ...
+class LLM(ABC):
+    """Abstract base class for a text-generation backend."""
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """A short identifier for this model, used in usage-log records."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate(self, prompt: str, role: Optional[str] = None) -> str:
+        """Generate a completion for ``prompt``, optionally tailored to ``role``."""
+        raise NotImplementedError
 
 
 class FakeLLM(LLM):
-    """Deterministic per-role templates so the graph is fully testable offline."""
+    """A deterministic, offline stand-in for a real LLM.
 
-    def complete(self, role: str, prompt: str) -> str:
-        topic = prompt.split("Topic:", 1)[-1].strip().splitlines()[0] if "Topic:" in prompt else prompt[:60]
+    Behavior is dispatched on ``role`` so each agent node gets realistic,
+    distinct output without any network access:
 
-        if role == "researcher":
-            return textwrap.dedent(f"""\
-                Key findings on "{topic}":
-                1. Adoption of this area has grown significantly in production ML systems over the last two years.
-                2. The main technical challenges are latency, cost control, and evaluation/observability.
-                3. Leading approaches combine retrieval, orchestration frameworks, and human-in-the-loop review.
-                4. Open questions remain around reliability at scale and standardized evaluation metrics.""")
+    - ``"planner"``: decomposes a topic into exactly 3 subtopics.
+    - ``"researcher"``: writes findings for one subtopic using
+      :class:`WebSearchTool` results.
+    - ``"writer"``: drafts a structured report from research notes (and
+      incorporates critique feedback on revisions).
+    - ``"critic"``: returns ``APPROVE`` or ``REVISE`` with reasons.
+    - ``"fact_checker"``: scores groundedness of a draft against research
+      notes and flags unsupported sentences.
+    """
 
-        if role == "writer":
-            return textwrap.dedent(f"""\
-                # Report: {topic}
+    def __init__(self, search_tool: Optional[WebSearchTool] = None) -> None:
+        self._search_tool = search_tool or WebSearchTool()
 
-                ## Overview
-                {topic} has become a core capability in modern AI systems, driven by
-                the need for grounded, up-to-date, and explainable outputs.
+    @property
+    def model_name(self) -> str:
+        return "fake-llm"
 
-                ## Key Findings
-                {prompt.split('Research notes:', 1)[-1].strip()[:400]}
+    def generate(self, prompt: str, role: Optional[str] = None) -> str:
+        handler = {
+            "planner": self._planner,
+            "researcher": self._researcher,
+            "writer": self._writer,
+            "critic": self._critic,
+            "fact_checker": self._fact_checker,
+        }.get(role, self._default)
+        return handler(prompt)
 
-                ## Recommendation
-                Teams adopting this should invest early in evaluation tooling and
-                keep a human-in-the-loop review step for high-stakes outputs.""")
+    # -- role handlers ----------------------------------------------------
 
-        if role == "critic":
-            has_recommendation = "Recommendation" in prompt
-            has_findings = "Key Findings" in prompt
-            if has_recommendation and has_findings:
-                return "APPROVE: The report has clear findings and an actionable recommendation. No revision needed."
-            return "REVISE: Please add a concrete Recommendation section and ensure Key Findings are explicit."
+    def _default(self, prompt: str) -> str:
+        return f"[fake-llm] response to: {prompt[:120]}"
 
-        return f"[{role}] " + prompt[:200]
+    def _planner(self, prompt: str) -> str:
+        topic = prompt.strip() or "the topic"
+        subtopics = [
+            f"Background and definition of {topic}",
+            f"Current state and key developments in {topic}",
+            f"Challenges and future outlook for {topic}",
+        ]
+        return "\n".join(subtopics)
+
+    def _researcher(self, prompt: str) -> str:
+        # `prompt` is expected to be the subtopic itself.
+        subtopic = prompt.strip()
+        hits: List[SearchHit] = self._search_tool.run(subtopic, top_k=2)
+        if not hits:
+            return f"No sources were found for '{subtopic}'."
+        lines = [f"Research findings on '{subtopic}':"]
+        for hit in hits:
+            lines.append(f"- According to '{hit.title}' ({hit.source_id}): {hit.snippet}")
+        return "\n".join(lines)
+
+    def _writer(self, prompt: str) -> str:
+        return (
+            "# Report\n\n"
+            "## Summary\n"
+            f"{prompt.strip()[:400]}\n\n"
+            "## Conclusion\n"
+            "This report synthesizes the research findings above into a "
+            "coherent overview of the topic."
+        )
+
+    def _critic(self, prompt: str) -> str:
+        # Deterministic rule used by tests/demo, driven by the real
+        # `revision_count` that `make_critic` embeds in the prompt: the very
+        # first pass (revision_count == 0) always comes back REVISE, and
+        # every subsequent pass APPROVEs, as long as the draft is at least
+        # minimally structured (has a heading). This exercises a genuine
+        # "revise once, then approve" loop through real graph state, rather
+        # than hardcoding the outcome.
+        match = re.search(r"REVISION_COUNT:\s*(\d+)", prompt)
+        revision_count = int(match.group(1)) if match else 0
+        has_structure = "#" in prompt
+        if revision_count == 0 or not has_structure:
+            return "REVISE\nReasons: The draft is missing a clear conclusion or needs another pass."
+        return "APPROVE\nReasons: The draft is well-structured and covers the research notes."
+
+    def _fact_checker(self, prompt: str) -> str:
+        # `prompt` contains both the draft and the research notes, joined by
+        # make_fact_checker. We do a crude but deterministic groundedness
+        # check: score = fraction of draft sentences that share at least one
+        # non-trivial keyword with the research notes.
+        return prompt  # actual scoring logic lives in agents.make_fact_checker
 
 
 class OpenAILLM(LLM):
-    def __init__(self, model: str = "gpt-4.1-mini"):
-        try:
-            from openai import OpenAI
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError("pip install openai to use OpenAILLM") from exc
-        self._client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        self._model = model
+    """Thin wrapper around the OpenAI chat completions API."""
 
-    def complete(self, role: str, prompt: str) -> str:
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": f"You are the {role} agent in a multi-agent research crew."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-        )
-        return resp.choices[0].message.content.strip()
+    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None) -> None:
+        self._model = model
+        self._api_key = api_key
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @retry_with_backoff(exceptions=(Exception,), max_attempts=3)
+    def generate(self, prompt: str, role: Optional[str] = None) -> str:
+        try:
+            from openai import OpenAI  # type: ignore
+        except ImportError as exc:  # pragma: no cover - exercised only without the optional dep
+            raise RuntimeError(
+                "The 'openai' package is required to use OpenAILLM. Install it with "
+                "`pip install openai`."
+            ) from exc
+
+        client = OpenAI(api_key=self._api_key)
+        system = f"You are the {role} agent in a multi-agent research crew." if role else None
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        response = client.chat.completions.create(model=self._model, messages=messages)
+        return response.choices[0].message.content or ""
 
 
 class AnthropicLLM(LLM):
-    def __init__(self, model: str = "claude-sonnet-5"):
-        try:
-            import anthropic
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError("pip install anthropic to use AnthropicLLM") from exc
-        self._client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        self._model = model
+    """Thin wrapper around the Anthropic messages API."""
 
-    def complete(self, role: str, prompt: str) -> str:
-        resp = self._client.messages.create(
+    def __init__(self, model: str = "claude-3-5-sonnet", api_key: Optional[str] = None) -> None:
+        self._model = model
+        self._api_key = api_key
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @retry_with_backoff(exceptions=(Exception,), max_attempts=3)
+    def generate(self, prompt: str, role: Optional[str] = None) -> str:
+        try:
+            import anthropic  # type: ignore
+        except ImportError as exc:  # pragma: no cover - exercised only without the optional dep
+            raise RuntimeError(
+                "The 'anthropic' package is required to use AnthropicLLM. Install it with "
+                "`pip install anthropic`."
+            ) from exc
+
+        client = anthropic.Anthropic(api_key=self._api_key)
+        system = f"You are the {role} agent in a multi-agent research crew." if role else ""
+        response = client.messages.create(
             model=self._model,
-            max_tokens=512,
-            system=f"You are the {role} agent in a multi-agent research crew.",
+            max_tokens=1024,
+            system=system,
             messages=[{"role": "user", "content": prompt}],
         )
-        return resp.content[0].text.strip()
-
-
-def get_llm(kind: str | None = None) -> LLM:
-    kind = kind or os.environ.get("AGENTCREW_LLM", "fake")
-    if kind == "fake":
-        return FakeLLM()
-    if kind == "openai":
-        return OpenAILLM()
-    if kind == "anthropic":
-        return AnthropicLLM()
-    raise ValueError(f"Unknown LLM kind: {kind}")
+        return "".join(block.text for block in response.content if hasattr(block, "text"))
