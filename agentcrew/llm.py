@@ -92,10 +92,20 @@ class FakeLLM(LLM):
         return "\n".join(lines)
 
     def _writer(self, prompt: str) -> str:
+        # On a revision pass, `prompt` is prefixed with the critique text
+        # ("Revise the report using this critique:\n...") before the actual
+        # research notes. The summary must always be built from the research
+        # notes themselves, never from that critique preamble -- otherwise a
+        # revised draft's "Summary" ends up echoing the critic's instructions
+        # ("Revise the report using this critique: REVISE Reasons: ...")
+        # instead of the source material.
+        marker = "Research notes:\n"
+        idx = prompt.find(marker)
+        notes = prompt[idx + len(marker):] if idx != -1 else prompt
         return (
             "# Report\n\n"
             "## Summary\n"
-            f"{prompt.strip()[:400]}\n\n"
+            f"{notes.strip()[:400]}\n\n"
             "## Conclusion\n"
             "This report synthesizes the research findings above into a "
             "coherent overview of the topic."
